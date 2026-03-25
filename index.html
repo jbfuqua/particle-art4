@@ -1,0 +1,487 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>3D Galaxy — Light Trails</title>
+    <style>
+        body { margin: 0; overflow: hidden; background: #000; }
+        canvas { display: block; }
+    </style>
+</head>
+<body>
+    <canvas id="canvasWebGL2"></canvas>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/gl-matrix/2.8.1/gl-matrix-min.js"></script>
+    <script>
+const [width, height] = [window.innerWidth, window.innerHeight]
+
+// ── Tunable ──
+const NUM_POINTS = 3000
+const TRAIL_LENGTH = 60          // frames of trail history
+const TRAIL_WIDTH = 1.5          // thinner lines
+const FADE_ALPHA = 0.06          // faster fade — more black between trails
+const BLOOM_DOWNSAMPLE = 4
+const BLOOM_INTENSITY = 1.4
+const BLOOM_PASSES = 2
+
+const main = async () => {
+    const canvas = document.getElementById("canvasWebGL2")
+    const gl = canvas.getContext("webgl2")
+    const ext = gl.getExtension('EXT_color_buffer_float')
+    resizeCanvas(canvas, gl, width, height)
+
+    // ══════════════════════════════════════════════════
+    //  PROGRAMS
+    // ══════════════════════════════════════════════════
+    const trailProgram = createProgram(gl, trailVert, trailFrag)
+    const fadeProgram = createProgram(gl, quadVert, fadeFrag)
+    const blurProgram = createProgram(gl, quadVert, blurFrag)
+    const compositeProgram = createProgram(gl, quadVert, compositeFrag)
+
+    // ══════════════════════════════════════════════════
+    //  FRAMEBUFFERS
+    // ══════════════════════════════════════════════════
+    const sceneFBO = createFBO(gl, width, height, false)
+    const blurW = Math.floor(width / BLOOM_DOWNSAMPLE)
+    const blurH = Math.floor(height / BLOOM_DOWNSAMPLE)
+    const blurFBO_A = createFBO(gl, blurW, blurH, false)
+    const blurFBO_B = createFBO(gl, blurW, blurH, false)
+
+    // Clear scene FBO to black initially
+    gl.bindFramebuffer(gl.FRAMEBUFFER, sceneFBO.fbo)
+    gl.clearColor(0, 0, 0, 1)
+    gl.clear(gl.COLOR_BUFFER_BIT)
+    gl.bindFramebuffer(gl.FRAMEBUFFER, null)
+
+    // Fullscreen quad
+    const quadVAO = gl.createVertexArray()
+    gl.bindVertexArray(quadVAO)
+    const quadBuf = gl.createBuffer()
+    gl.bindBuffer(gl.ARRAY_BUFFER, quadBuf)
+    gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([-1,-1, 1,-1, -1,1, 1,1]), gl.STATIC_DRAW)
+    gl.enableVertexAttribArray(0)
+    gl.vertexAttribPointer(0, 2, gl.FLOAT, false, 0, 0)
+    gl.bindVertexArray(null)
+
+    // ══════════════════════════════════════════════════
+    //  PARTICLE INIT — galaxy distribution
+    // ══════════════════════════════════════════════════
+    const numArms = 5
+    const armSpread = 0.5
+    const diskRadius = 1.0
+    const diskThickness = 0.2
+    const bulgeSize = 0.3
+
+    // Each particle: base position + seed for color
+    const particles = []
+    for (let i = 0; i < NUM_POINTS; i++) {
+        const r = Math.pow(Math.random(), 0.5) * diskRadius
+        const theta = Math.random() * 2 * Math.PI
+        const armIndex = i % numArms
+        const armOffset = armIndex * (2 * Math.PI / numArms)
+        const spiralTheta = theta + armOffset + armSpread * Math.pow(r, 0.5)
+
+        const x = r * Math.cos(spiralTheta)
+        const y = r * Math.sin(spiralTheta)
+
+        const bulgeTransition = Math.pow(Math.min(1, r / bulgeSize), 2)
+        const diskProfile = Math.sqrt(1 - Math.pow(r / diskRadius, 2))
+        const heightFactor = (1 - bulgeTransition) + diskProfile * bulgeTransition
+        const maxHeight = diskThickness * heightFactor
+
+        let z
+        if (r < bulgeSize) {
+            const phi = Math.acos(2 * Math.random() - 1)
+            z = r * Math.cos(phi) * (bulgeSize - r) / bulgeSize
+        } else {
+            z = (Math.random() - 0.5) * maxHeight
+        }
+
+        particles.push({
+            basePos: [x, y, z],
+            dist: Math.sqrt(x*x + y*y + z*z),
+            seed: Math.random()
+        })
+    }
+
+    // ══════════════════════════════════════════════════
+    //  TRAIL BUFFER — lines between consecutive positions
+    //  Each segment: posA(3) + colorA(4) + posB(3) + colorB(4) = 14 floats
+    //  But we use two vertices per segment with interleaved pos+color
+    // ══════════════════════════════════════════════════
+    // Max vertices: NUM_POINTS * (TRAIL_LENGTH - 1) * 2 vertices
+    // Each vertex: position(3) + color(4) = 7 floats
+    const maxSegments = NUM_POINTS * (TRAIL_LENGTH - 1)
+    const maxVerts = maxSegments * 2
+    const trailData = new Float32Array(maxVerts * 7)
+
+    const trailVAO = gl.createVertexArray()
+    gl.bindVertexArray(trailVAO)
+    const trailBuffer = gl.createBuffer()
+    gl.bindBuffer(gl.ARRAY_BUFFER, trailBuffer)
+    gl.bufferData(gl.ARRAY_BUFFER, trailData.byteLength, gl.DYNAMIC_DRAW)
+    // position
+    gl.enableVertexAttribArray(0)
+    gl.vertexAttribPointer(0, 3, gl.FLOAT, false, 28, 0)
+    // color
+    gl.enableVertexAttribArray(1)
+    gl.vertexAttribPointer(1, 4, gl.FLOAT, false, 28, 12)
+    gl.bindVertexArray(null)
+
+    // Position history ring buffers
+    const history = particles.map(() => [])
+
+    // ══════════════════════════════════════════════════
+    //  UNIFORMS
+    // ══════════════════════════════════════════════════
+    const projectionMatrix = mat4.create()
+    mat4.perspective(projectionMatrix, Math.PI / 4, width / height, 0.1, 100)
+    const viewMatrix = mat4.create()
+    const mvpMatrix = mat4.create()
+
+    const trailMVPLoc = gl.getUniformLocation(trailProgram, "uMVP")
+    const fadeAlphaLoc = gl.getUniformLocation(fadeProgram, "uAlpha")
+    const blurTexLoc = gl.getUniformLocation(blurProgram, "uTexture")
+    const blurDirLoc = gl.getUniformLocation(blurProgram, "uDirection")
+    const compSceneLoc = gl.getUniformLocation(compositeProgram, "uScene")
+    const compBloomLoc = gl.getUniformLocation(compositeProgram, "uBloom")
+    const compIntensityLoc = gl.getUniformLocation(compositeProgram, "uBloomIntensity")
+
+    let time = 0
+
+    // ══════════════════════════════════════════════════
+    //  PHYSICS (JS-side — transforms base positions)
+    // ══════════════════════════════════════════════════
+    function transformPosition(base, dist, t) {
+        let x = base[0], y = base[1], z = base[2]
+
+        // Primary rotation (around Y-ish axis)
+        const pa = t * 0.5
+        const cp = Math.cos(pa), sp = Math.sin(pa)
+        let nx = cp * x + sp * z
+        let nz = -sp * x + cp * z
+        x = nx; z = nz
+
+        // Secondary rotation (around X axis)
+        const sa = t * 0.8
+        const cs = Math.cos(sa), ss = Math.sin(sa)
+        let ny = cs * y - ss * z
+        nz = ss * y + cs * z
+        y = ny; z = nz
+
+        // Differential rotation (inner faster)
+        const rf = 1.0 - dist
+        const da = t * 0.5 * (rf + 0.1)
+        const cd = Math.cos(da), sd = Math.sin(da)
+        nx = cd * x + sd * z
+        nz = -sd * x + cd * z
+        x = nx; z = nz
+
+        // Gentle pulse
+        const pulse = Math.sin(t * 2.0) * 0.01 + 1.0
+        x *= pulse; y *= pulse; z *= pulse
+
+        return [x, y, z]
+    }
+
+    // ══════════════════════════════════════════════════
+    //  COLOR (hue from position)
+    // ══════════════════════════════════════════════════
+    // Psychedelic palette — electric blue dominant, fire accents
+    // Blues are the ocean, reds/oranges/yellows erupt through it
+    const PALETTE = [
+        [0.0, 0.15, 1.0],   // deep electric blue
+        [0.0, 0.4,  1.0],   // bright blue
+        [0.0, 0.7,  1.0],   // cyan-blue
+        [0.0, 0.3,  0.9],   // dark blue
+        [1.0, 0.1,  0.0],   // hot red
+        [1.0, 0.5,  0.0],   // orange
+        [1.0, 0.9,  0.2],   // yellow-white burst
+        [1.0, 0.2,  0.0],   // red-orange
+        [0.2, 0.0,  0.8],   // violet
+        [0.0, 0.15, 1.0],   // back to deep blue (wraps)
+    ]
+
+    function paletteColor(t) {
+        t = ((t % 1.0) + 1.0) % 1.0
+        const idx = t * (PALETTE.length - 1)
+        const i = Math.floor(idx)
+        const f = idx - i
+        // Smooth cubic interpolation for organic blending
+        const sf = f * f * (3 - 2 * f)
+        const a = PALETTE[i], b = PALETTE[Math.min(i + 1, PALETTE.length - 1)]
+        return [
+            a[0] + (b[0] - a[0]) * sf,
+            a[1] + (b[1] - a[1]) * sf,
+            a[2] + (b[2] - a[2]) * sf,
+        ]
+    }
+
+    // ══════════════════════════════════════════════════
+    //  DRAW LOOP
+    // ══════════════════════════════════════════════════
+    const draw = () => {
+        // Camera orbit
+        const camAngle = time * 0.12
+        const camRadius = 2.4
+        const camHeight = 0.9 + Math.sin(time * 0.06) * 0.5
+        mat4.lookAt(viewMatrix,
+            [Math.cos(camAngle) * camRadius, Math.sin(camAngle) * camRadius, camHeight],
+            [0, 0, 0], [0, 0, 1])
+        mat4.multiply(mvpMatrix, projectionMatrix, viewMatrix)
+
+        // ── Update particle positions & history ──
+        let vertCount = 0
+        let dataOffset = 0
+
+        for (let i = 0; i < NUM_POINTS; i++) {
+            const p = particles[i]
+            const pos = transformPosition(p.basePos, p.dist, time)
+
+            // Push to history
+            const hist = history[i]
+            hist.push(pos)
+            if (hist.length > TRAIL_LENGTH) hist.shift()
+
+            // Hallucinatory color field — overlapping waves for organic swirl
+            const px = pos[0], py = pos[1], pz = pos[2]
+            const wave1 = Math.sin(px * 4.0 + time * 0.3) * 0.5 + 0.5
+            const wave2 = Math.sin(py * 5.0 - time * 0.2 + px * 3.0) * 0.5 + 0.5
+            const wave3 = Math.sin((px + py) * 3.0 + pz * 8.0 + time * 0.15) * 0.5 + 0.5
+            const wave4 = Math.sin(Math.atan2(py, px) * 3.0 + Math.sqrt(px*px+py*py) * 6.0 - time * 0.4) * 0.5 + 0.5
+            // Blend waves — weighted toward blue range with fire bursts
+            const hue = (wave1 * 0.3 + wave2 * 0.25 + wave3 * 0.2 + wave4 * 0.25 + p.seed * 0.05) % 1.0
+            const [cr, cg, cb] = paletteColor(hue)
+
+            // Build line segments from history
+            for (let j = 0; j < hist.length - 1; j++) {
+                const t0 = j / (hist.length - 1)       // 0 at tail
+                const t1 = (j + 1) / (hist.length - 1) // 1 at head
+
+                // Lower alpha — trails are delicate, don't stack to white
+                const a0 = t0 * t0 * 0.35
+                const a1 = t1 * t1 * 0.35
+
+                // Brightness: dim tail, vivid head
+                const b0 = 0.3 + t0 * 0.7
+                const b1 = 0.3 + t1 * 0.7
+
+                // Vertex A
+                trailData[dataOffset++] = hist[j][0]
+                trailData[dataOffset++] = hist[j][1]
+                trailData[dataOffset++] = hist[j][2]
+                trailData[dataOffset++] = cr * b0
+                trailData[dataOffset++] = cg * b0
+                trailData[dataOffset++] = cb * b0
+                trailData[dataOffset++] = a0
+
+                // Vertex B
+                trailData[dataOffset++] = hist[j+1][0]
+                trailData[dataOffset++] = hist[j+1][1]
+                trailData[dataOffset++] = hist[j+1][2]
+                trailData[dataOffset++] = cr * b1
+                trailData[dataOffset++] = cg * b1
+                trailData[dataOffset++] = cb * b1
+                trailData[dataOffset++] = a1
+
+                vertCount += 2
+            }
+        }
+
+        // Upload trail data
+        gl.bindBuffer(gl.ARRAY_BUFFER, trailBuffer)
+        gl.bufferSubData(gl.ARRAY_BUFFER, 0, trailData.subarray(0, dataOffset))
+
+        // ── Pass 1: Fade + draw trails to scene FBO ──
+        gl.bindFramebuffer(gl.FRAMEBUFFER, sceneFBO.fbo)
+        gl.viewport(0, 0, width, height)
+
+        // Fade previous frame (creates trail persistence)
+        gl.enable(gl.BLEND)
+        gl.blendFunc(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA)
+        gl.useProgram(fadeProgram)
+        gl.uniform1f(fadeAlphaLoc, FADE_ALPHA)
+        gl.bindVertexArray(quadVAO)
+        gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4)
+
+        // Draw new trail segments additively
+        gl.blendFunc(gl.SRC_ALPHA, gl.ONE)
+        gl.useProgram(trailProgram)
+        gl.uniformMatrix4fv(trailMVPLoc, false, mvpMatrix)
+        gl.bindVertexArray(trailVAO)
+        gl.lineWidth(TRAIL_WIDTH)
+        gl.drawArrays(gl.LINES, 0, vertCount)
+        gl.bindVertexArray(null)
+
+        // ── Pass 2: Bloom blur ──
+        gl.disable(gl.BLEND)
+        gl.useProgram(blurProgram)
+        gl.bindVertexArray(quadVAO)
+
+        for (let p = 0; p < BLOOM_PASSES; p++) {
+            gl.bindFramebuffer(gl.FRAMEBUFFER, blurFBO_B.fbo)
+            gl.viewport(0, 0, blurW, blurH)
+            gl.activeTexture(gl.TEXTURE0)
+            gl.bindTexture(gl.TEXTURE_2D, p === 0 ? sceneFBO.texture : blurFBO_A.texture)
+            gl.uniform1i(blurTexLoc, 0)
+            gl.uniform2f(blurDirLoc, 1.0 / blurW, 0.0)
+            gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4)
+
+            gl.bindFramebuffer(gl.FRAMEBUFFER, blurFBO_A.fbo)
+            gl.bindTexture(gl.TEXTURE_2D, blurFBO_B.texture)
+            gl.uniform2f(blurDirLoc, 0.0, 1.0 / blurH)
+            gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4)
+        }
+
+        // ── Pass 3: Composite to screen ──
+        gl.bindFramebuffer(gl.FRAMEBUFFER, null)
+        gl.viewport(0, 0, width, height)
+        gl.useProgram(compositeProgram)
+
+        gl.activeTexture(gl.TEXTURE0)
+        gl.bindTexture(gl.TEXTURE_2D, sceneFBO.texture)
+        gl.uniform1i(compSceneLoc, 0)
+
+        gl.activeTexture(gl.TEXTURE1)
+        gl.bindTexture(gl.TEXTURE_2D, blurFBO_A.texture)
+        gl.uniform1i(compBloomLoc, 1)
+
+        gl.uniform1f(compIntensityLoc, BLOOM_INTENSITY)
+        gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4)
+        gl.bindVertexArray(null)
+
+        time += 0.005
+        requestAnimationFrame(draw)
+    }
+    draw()
+}
+
+// ══════════════════════════════════════════════════════════════════
+//  SHADERS
+// ══════════════════════════════════════════════════════════════════
+
+const trailVert = `#version 300 es
+precision highp float;
+layout(location = 0) in vec3 aPosition;
+layout(location = 1) in vec4 aColor;
+uniform mat4 uMVP;
+out vec4 vColor;
+void main() {
+    gl_Position = uMVP * vec4(aPosition, 1.0);
+    vColor = aColor;
+}
+`
+
+const trailFrag = `#version 300 es
+precision highp float;
+in vec4 vColor;
+out vec4 fragColor;
+void main() {
+    fragColor = vColor;
+}
+`
+
+const quadVert = `#version 300 es
+layout(location = 0) in vec2 aPosition;
+out vec2 vUV;
+void main() {
+    vUV = aPosition * 0.5 + 0.5;
+    gl_Position = vec4(aPosition, 0.0, 1.0);
+}
+`
+
+const fadeFrag = `#version 300 es
+precision highp float;
+in vec2 vUV;
+out vec4 fragColor;
+uniform float uAlpha;
+void main() {
+    fragColor = vec4(0.0, 0.0, 0.0, uAlpha);
+}
+`
+
+const blurFrag = `#version 300 es
+precision highp float;
+in vec2 vUV;
+out vec4 fragColor;
+uniform sampler2D uTexture;
+uniform vec2 uDirection;
+void main() {
+    float weights[7] = float[](0.0205, 0.0855, 0.232, 0.324, 0.232, 0.0855, 0.0205);
+    vec3 result = vec3(0.0);
+    for (int i = -3; i <= 3; i++) {
+        vec2 offset = uDirection * float(i) * 2.0;
+        result += texture(uTexture, vUV + offset).rgb * weights[i + 3];
+    }
+    fragColor = vec4(result, 1.0);
+}
+`
+
+const compositeFrag = `#version 300 es
+precision highp float;
+in vec2 vUV;
+out vec4 fragColor;
+uniform sampler2D uScene;
+uniform sampler2D uBloom;
+uniform float uBloomIntensity;
+void main() {
+    vec3 scene = texture(uScene, vUV).rgb;
+    vec3 bloom = texture(uBloom, vUV).rgb;
+    vec3 result = scene + bloom * uBloomIntensity;
+    // Re-saturate to fight bloom washout
+    float luma = dot(result, vec3(0.299, 0.587, 0.114));
+    result = mix(vec3(luma), result, 1.5);
+    fragColor = vec4(clamp(result, 0.0, 1.0), 1.0);
+}
+`
+
+// ══════════════════════════════════════════════════════════════════
+//  UTILITIES
+// ══════════════════════════════════════════════════════════════════
+function createProgram(gl, vertSrc, fragSrc) {
+    const prog = gl.createProgram()
+    const vs = gl.createShader(gl.VERTEX_SHADER)
+    gl.shaderSource(vs, vertSrc)
+    gl.compileShader(vs)
+    if (!gl.getShaderParameter(vs, gl.COMPILE_STATUS))
+        console.error('Vert:', gl.getShaderInfoLog(vs))
+    gl.attachShader(prog, vs)
+
+    const fs = gl.createShader(gl.FRAGMENT_SHADER)
+    gl.shaderSource(fs, fragSrc)
+    gl.compileShader(fs)
+    if (!gl.getShaderParameter(fs, gl.COMPILE_STATUS))
+        console.error('Frag:', gl.getShaderInfoLog(fs))
+    gl.attachShader(prog, fs)
+
+    gl.linkProgram(prog)
+    if (!gl.getProgramParameter(prog, gl.LINK_STATUS))
+        console.error('Link:', gl.getProgramInfoLog(prog))
+    return prog
+}
+
+function createFBO(gl, w, h) {
+    const fbo = gl.createFramebuffer()
+    gl.bindFramebuffer(gl.FRAMEBUFFER, fbo)
+    const texture = gl.createTexture()
+    gl.bindTexture(gl.TEXTURE_2D, texture)
+    gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA16F, w, h, 0, gl.RGBA, gl.HALF_FLOAT, null)
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR)
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR)
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE)
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE)
+    gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, texture, 0)
+    gl.bindFramebuffer(gl.FRAMEBUFFER, null)
+    return { fbo, texture }
+}
+
+function resizeCanvas(canvas, gl, width, height) {
+    canvas.width = width
+    canvas.height = height
+    gl.viewport(0, 0, width, height)
+}
+
+main()
+    </script>
+</body>
+</html>
