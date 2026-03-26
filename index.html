@@ -727,6 +727,12 @@ let particles = []
 let history = []
 let needsReset = true
 
+// ── Scene transition state ──
+const TRANSITION_FRAMES = 120 // ~2 sec at 60fps
+let transitionProgress = -1 // -1 = no transition active
+let transitionFrom = null // { sceneIndex, particles, time }
+let transitionTo = null
+
 function resetScene() {
     const scene = SCENES[currentScene]
     particles = scene.init()
@@ -736,8 +742,27 @@ function resetScene() {
 }
 
 function cycleScene(dir = 1) {
+    const prevIndex = currentScene
     currentScene = (currentScene + dir + SCENES.length) % SCENES.length
-    needsReset = true
+    // Start fluid transition instead of hard reset
+    const newScene = SCENES[currentScene]
+    const newParticles = newScene.init()
+    transitionFrom = { sceneIndex: prevIndex, particles: particles, time: 0 }
+    transitionTo = { sceneIndex: currentScene, particles: newParticles, time: 0 }
+    // Ensure both particle arrays are same length by padding the shorter one
+    const maxLen = Math.max(transitionFrom.particles.length, transitionTo.particles.length)
+    while (transitionFrom.particles.length < maxLen) {
+        const src = transitionFrom.particles[transitionFrom.particles.length % particles.length]
+        transitionFrom.particles.push({ ...src, basePos: [...src.basePos] })
+    }
+    while (transitionTo.particles.length < maxLen) {
+        const src = transitionTo.particles[transitionTo.particles.length % newParticles.length]
+        transitionTo.particles.push({ ...src, basePos: [...src.basePos] })
+    }
+    // Expand history to match
+    while (history.length < maxLen) history.push([])
+    transitionProgress = 0
+    updateHUD()
     flashHUD()
 }
 
@@ -772,11 +797,12 @@ const ASPECT_MODES = [
     { name: '1:1', ratio: 1 },
     { name: '9:16', ratio: 9/16 },
 ]
-let currentAspect = 0 // start at 16:9 (full screen on most monitors)
+const isMobileDevice = matchMedia('(pointer: coarse), (hover: none)').matches
+let currentAspect = isMobileDevice ? 1 : 0 // mobile starts at 1:1, desktop at 16:9
 
 let autoCycleActive = false
 let autoCycleTimer = 0
-const AUTO_CYCLE_INTERVAL = 480 // frames between transitions (~8 sec at 60fps)
+const AUTO_CYCLE_INTERVAL = 300 // frames between transitions (~5 sec at 60fps)
 let autoCycleMode = 0 // 0=cycle scene, 1=cycle palette, alternates
 
 function getCanvasSize() {
@@ -1226,7 +1252,41 @@ const main = () => {
 
         const scene = SCENES[currentScene]
         const palette = PALETTES[currentPalette]
-        const cam = scene.camera
+
+        // Handle transition blending
+        const inTransition = transitionProgress >= 0 && transitionProgress <= 1
+        let tEase = 0
+        if (inTransition) {
+            transitionProgress += 1 / TRANSITION_FRAMES
+            // Smooth ease-in-out
+            tEase = transitionProgress < 0.5
+                ? 2 * transitionProgress * transitionProgress
+                : 1 - Math.pow(-2 * transitionProgress + 2, 2) / 2
+            if (transitionProgress >= 1) {
+                // Transition complete — commit to new scene
+                particles = transitionTo.particles
+                history = history.slice(0, particles.length)
+                transitionProgress = -1
+                transitionFrom = null
+                transitionTo = null
+            }
+        }
+
+        // Camera — blend between old and new during transition
+        let cam
+        if (inTransition && transitionFrom) {
+            const camA = SCENES[transitionFrom.sceneIndex].camera
+            const camB = SCENES[transitionTo.sceneIndex].camera
+            cam = {
+                radius: camA.radius + (camB.radius - camA.radius) * tEase,
+                height: camA.height + (camB.height - camA.height) * tEase,
+                heightWave: camA.heightWave + (camB.heightWave - camA.heightWave) * tEase,
+                speed: camA.speed + (camB.speed - camA.speed) * tEase,
+                heightSpeed: camA.heightSpeed + (camB.heightSpeed - camA.heightSpeed) * tEase,
+            }
+        } else {
+            cam = scene.camera
+        }
 
         // Camera orbit
         const camAngle = time * cam.speed
@@ -1239,16 +1299,41 @@ const main = () => {
         // Update particles
         let vertCount = 0, dataOffset = 0
 
+        const activeCount = inTransition && transitionTo
+            ? Math.max(transitionFrom.particles.length, transitionTo.particles.length)
+            : particles.length
 
-        for (let i = 0; i < particles.length; i++) {
-            const p = particles[i]
-            const pos = scene.transform(p.basePos, p.dist, time, p)
+        for (let i = 0; i < activeCount; i++) {
+            let pos
+            let p
+            if (inTransition && transitionFrom && transitionTo) {
+                const fromScene = SCENES[transitionFrom.sceneIndex]
+                const toScene = SCENES[transitionTo.sceneIndex]
+                const pFrom = transitionFrom.particles[i]
+                const pTo = transitionTo.particles[i]
+                p = pTo
+                const posA = fromScene.transform(pFrom.basePos, pFrom.dist, time, pFrom)
+                transitionTo.time += 0 // keep time in sync
+                const posB = toScene.transform(pTo.basePos, pTo.dist, time, pTo)
+                pos = [
+                    posA[0] + (posB[0] - posA[0]) * tEase,
+                    posA[1] + (posB[1] - posA[1]) * tEase,
+                    posA[2] + (posB[2] - posA[2]) * tEase,
+                ]
+            } else {
+                p = particles[i]
+                pos = scene.transform(p.basePos, p.dist, time, p)
+            }
 
+            if (!history[i]) history[i] = []
             const hist = history[i]
             // Clear history on respawn to prevent long streaks
             if (p.respawned) hist.length = 0
             hist.push(pos)
-            if (hist.length > scene.trailLength) hist.shift()
+            const maxTrail = inTransition
+                ? Math.max(SCENES[transitionFrom.sceneIndex].trailLength, SCENES[transitionTo.sceneIndex].trailLength)
+                : scene.trailLength
+            if (hist.length > maxTrail) hist.shift()
 
             // Color field
             const px = pos[0], py = pos[1], pz = pos[2]
@@ -1297,7 +1382,10 @@ const main = () => {
         gl.enable(gl.BLEND)
         gl.blendFunc(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA)
         gl.useProgram(fadeProgram)
-        gl.uniform1f(fadeAlphaLoc, scene.fadeAlpha)
+        const fadeAlpha = inTransition && transitionFrom
+            ? SCENES[transitionFrom.sceneIndex].fadeAlpha + (SCENES[transitionTo.sceneIndex].fadeAlpha - SCENES[transitionFrom.sceneIndex].fadeAlpha) * tEase
+            : scene.fadeAlpha
+        gl.uniform1f(fadeAlphaLoc, fadeAlpha)
         gl.bindVertexArray(quadVAO)
         gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4)
 
