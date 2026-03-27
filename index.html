@@ -200,6 +200,27 @@ const PALETTES = [
         trailAlpha: 0.25,
     },
     {
+        name: "Chosen Path",
+        colors: [
+            [0.0, 0.15, 1.0],   // deep electric blue
+            [0.0, 0.4,  1.0],   // bright blue
+            [0.0, 0.7,  1.0],   // cyan-blue
+            [0.7, 0.9,  1.0],   // ice white-blue
+            [1.0, 1.0,  1.0],   // white flash
+            [0.7, 0.9,  1.0],   // ice white-blue
+            [0.0, 0.5,  1.0],   // blue
+            [0.0, 0.1,  0.6],   // deep dark blue
+            [0.8, 0.2,  0.0],   // warm red-orange accent
+            [1.0, 0.4,  0.0],   // orange glow
+            [0.8, 0.1,  0.0],   // deep red
+            [0.0, 0.1,  0.5],   // dark blue
+            [0.0, 0.15, 1.0],   // wrap
+        ],
+        bloomIntensity: 2.2,
+        saturationBoost: 1.5,
+        trailAlpha: 0.35,
+    },
+    {
         name: "Toxic",
         colors: [
             [0.0, 1.0, 0.0],    // pure green
@@ -303,26 +324,26 @@ const SCENES = [
         numPoints: 2000,
         trailLength: 70,
         fadeAlpha: 0.04,
-        camera: { radius: 3.0, height: 0.5, heightWave: 1.0, speed: 0.06, heightSpeed: 0.03 },
+        camera: { radius: 3.5, height: 0.3, heightWave: 1.2, speed: 0.06, heightSpeed: 0.03 },
         init() {
             const particles = []
             for (let i = 0; i < this.numPoints; i++) {
                 // Bell shape — hemisphere top, tentacles below
-                const isTentacle = Math.random() < 0.4
+                const isTentacle = Math.random() < 0.45
                 let x, y, z
                 if (isTentacle) {
                     const theta = Math.random() * 2 * Math.PI
-                    const r = 0.15 + Math.random() * 0.7
+                    const r = 0.15 + Math.random() * 0.75
                     x = r * Math.cos(theta)
                     y = r * Math.sin(theta)
-                    z = -(Math.random() * 1.2)
+                    z = -(Math.random() * 2.0)
                 } else {
                     const phi = Math.random() * Math.PI * 0.5
                     const theta = Math.random() * 2 * Math.PI
-                    const r = 0.9 + Math.random() * 0.3
+                    const r = 1.1 + Math.random() * 0.3
                     x = r * Math.sin(phi) * Math.cos(theta)
                     y = r * Math.sin(phi) * Math.sin(theta)
-                    z = r * Math.cos(phi) * 0.4
+                    z = r * Math.cos(phi) * 0.5
                 }
                 particles.push({ basePos: [x, y, z], dist: Math.sqrt(x*x + y*y), seed: Math.random(), isTentacle })
             }
@@ -710,6 +731,136 @@ const SCENES = [
             return [rx, y, rz]
         }
     },
+    {
+        name: "Pulsing Star",
+        numPoints: 3000,
+        trailLength: 60,
+        fadeAlpha: 0.045,
+        camera: { radius: 3.5, height: 0.6, heightWave: 0.8, speed: 0.04, heightSpeed: 0.025 },
+        _flares: [],
+        _lastFlareTime: 0,
+        init() {
+            this._flares = []
+            this._lastFlareTime = 0
+            const particles = []
+            const R = 0.7
+            for (let i = 0; i < this.numPoints; i++) {
+                const phi = Math.acos(2 * Math.random() - 1)
+                const theta = Math.random() * 2 * Math.PI
+                const r = R + (Math.random() - 0.5) * 0.06
+                const x = r * Math.sin(phi) * Math.cos(theta)
+                const y = r * Math.sin(phi) * Math.sin(theta)
+                const z = r * Math.cos(phi)
+                const orbitSpeed = 0.15 + Math.random() * 0.2
+                const lat = Math.abs(Math.asin(z / r))
+                particles.push({
+                    basePos: [x, y, z], dist: r, seed: Math.random(),
+                    phi, theta, r, orbitSpeed, lat,
+                })
+            }
+            return particles
+        },
+        transform(base, dist, t, p) {
+            const R = 0.7
+            const diffRot = p.orbitSpeed * (1.0 - 0.3 * Math.sin(p.lat))
+            const theta = p.theta + t * diffRot
+            const phi = p.phi
+
+            let x = p.r * Math.sin(phi) * Math.cos(theta)
+            let y = p.r * Math.sin(phi) * Math.sin(theta)
+            let z = p.r * Math.cos(phi)
+
+            // ── Pulsing heartbeat ──
+            // Primary pulse — strong, rhythmic
+            const pulseFreq = 1.2
+            const rawPulse = Math.sin(t * pulseFreq)
+            const pulse = Math.pow(Math.max(0, rawPulse), 0.6) // sharp peaks, soft valleys
+            // Secondary sub-pulse for complexity
+            const subPulse = Math.pow(Math.max(0, Math.sin(t * pulseFreq * 2.0 + 0.5)), 0.8) * 0.3
+
+            // Expand radius on pulse — particles push outward
+            const expand = 1.0 + pulse * 0.5 + subPulse * 0.15
+            x *= expand; y *= expand; z *= expand
+
+            // Surface ripple — waves travel outward from poles on each beat
+            const ripplePhase = t * pulseFreq - phi * 2.0
+            const ripple = Math.sin(ripplePhase) * pulse * 0.12
+            const len = Math.sqrt(x*x + y*y + z*z) || 1
+            x += (x / len) * ripple
+            y += (y / len) * ripple
+            z += (z / len) * ripple
+
+            // Convection wobble — more intense during expansion
+            const conv = 0.02 + pulse * 0.04
+            x += Math.sin(t * 0.8 + p.seed * 20.0) * conv
+            y += Math.sin(t * 0.7 + p.seed * 15.0 + 1.0) * conv
+            z += Math.sin(t * 0.9 + p.seed * 25.0 + 2.0) * conv
+
+            // Spawn flares on pulse peaks
+            if (rawPulse > 0.9 && t - this._lastFlareTime > 0.3) {
+                this._lastFlareTime = t
+                const burstCount = 1 + Math.floor(Math.random() * 3)
+                for (let b = 0; b < burstCount; b++) {
+                    const fPhi = Math.acos(2 * Math.random() - 1)
+                    const fTheta = Math.random() * 2 * Math.PI
+                    const fx = Math.sin(fPhi) * Math.cos(fTheta)
+                    const fy = Math.sin(fPhi) * Math.sin(fTheta)
+                    const fz = Math.cos(fPhi)
+                    const isMassive = Math.random() < 0.25
+                    this._flares.push({
+                        origin: [fx, fy, fz],
+                        birthTime: t,
+                        duration: isMassive ? 3.0 + Math.random() * 2.0 : 0.8 + Math.random() * 1.5,
+                        strength: isMassive ? 1.2 + Math.random() * 1.0 : 0.4 + Math.random() * 0.6,
+                        arcHeight: isMassive ? 1.5 + Math.random() * 1.0 : 0.4 + Math.random() * 0.6,
+                        spread: 0.2 + Math.random() * 0.3,
+                        twistSpeed: 2.0 + Math.random() * 3.0,
+                        twistStrength: 0.3 + Math.random() * 0.5,
+                    })
+                }
+                while (this._flares.length > 12) this._flares.shift()
+            }
+            this._flares = this._flares.filter(f => t - f.birthTime <= f.duration)
+
+            // Apply flare forces
+            for (const flare of this._flares) {
+                const age = t - flare.birthTime
+                if (age < 0 || age > flare.duration) continue
+
+                const flen = Math.sqrt(x*x + y*y + z*z) || 1
+                const nx = x / flen, ny = y / flen, nz = z / flen
+
+                const dot = nx * flare.origin[0] + ny * flare.origin[1] + nz * flare.origin[2]
+                const proximity = Math.max(0, dot)
+                const inFlare = Math.pow(proximity, 6.0 / (flare.spread * flare.spread))
+                if (inFlare < 0.01) continue
+
+                const life = age / flare.duration
+                const envelope = Math.pow(Math.sin(life * Math.PI), 0.6) * (1.0 - life * 0.2)
+                // Flares are stronger during pulse peaks
+                const pulseBoost = 1.0 + pulse * 0.8
+                const pushDist = flare.strength * flare.arcHeight * envelope * inFlare * pulseBoost
+
+                const cx = flare.origin[1] * nz - flare.origin[2] * ny
+                const cy = flare.origin[2] * nx - flare.origin[0] * nz
+                const cz = flare.origin[0] * ny - flare.origin[1] * nx
+                const twist = Math.sin(life * Math.PI * flare.twistSpeed) * flare.twistStrength * inFlare * envelope
+                const turb = Math.sin(life * 12.0 + p.seed * 30.0) * 0.06 * envelope * inFlare
+
+                x += nx * pushDist + cx * twist + cx * turb
+                y += ny * pushDist + cy * twist + cy * turb
+                z += nz * pushDist + cz * twist + cz * turb
+            }
+
+            // Slow tumble
+            const tumble = t * 0.04
+            const ct = Math.cos(tumble), st = Math.sin(tumble)
+            const rx = ct * x + st * z
+            const rz = -st * x + ct * z
+
+            return [rx, y, rz]
+        }
+    },
 ]
 
 // ══════════════════════════════════════════════════════════════════
@@ -726,12 +877,16 @@ let currentPalette = 0
 let particles = []
 let history = []
 let needsReset = true
+let needsFBOClear = false
+let time = 0
 
 // ── Scene transition state ──
-const TRANSITION_FRAMES = 120 // ~2 sec at 60fps
+const TRANSITION_FRAMES = 240 // ~4 sec at 60fps
 let transitionProgress = -1 // -1 = no transition active
-let transitionFrom = null // { sceneIndex, particles, time }
-let transitionTo = null
+let transitionSnapshots = null // frozen start positions
+let transitionTo = null // { sceneIndex, particles }
+let transitionFromSceneIndex = -1
+let transitionStagger = null // per-particle delay (0–0.3)
 
 function resetScene() {
     const scene = SCENES[currentScene]
@@ -744,24 +899,78 @@ function resetScene() {
 function cycleScene(dir = 1) {
     const prevIndex = currentScene
     currentScene = (currentScene + dir + SCENES.length) % SCENES.length
-    // Start fluid transition instead of hard reset
     const newScene = SCENES[currentScene]
     const newParticles = newScene.init()
-    transitionFrom = { sceneIndex: prevIndex, particles: particles, time: 0 }
-    transitionTo = { sceneIndex: currentScene, particles: newParticles, time: 0 }
-    // Ensure both particle arrays are same length by padding the shorter one
-    const maxLen = Math.max(transitionFrom.particles.length, transitionTo.particles.length)
-    while (transitionFrom.particles.length < maxLen) {
-        const src = transitionFrom.particles[transitionFrom.particles.length % particles.length]
-        transitionFrom.particles.push({ ...src, basePos: [...src.basePos] })
+
+    // Snapshot every particle's current rendered position
+    const snapshots = []
+    if (transitionSnapshots && transitionTo) {
+        // Interrupted mid-transition — grab current in-flight positions
+        const toScene = SCENES[transitionTo.sceneIndex]
+        const count = transitionSnapshots.length
+        for (let i = 0; i < count; i++) {
+            const pTo = transitionTo.particles[i]
+            const delay = transitionStagger[i]
+            const localT = Math.max(0, Math.min(1, (transitionProgress - delay) / (1 - delay)))
+            const tEase = localT < 1
+                ? 1 - Math.pow(1 - localT, 3) + Math.sin(localT * Math.PI) * 0.08
+                : 1
+            const snap = transitionSnapshots[i]
+            const target = toScene.transform(pTo.basePos, pTo.dist, time, pTo)
+            snapshots.push([
+                snap[0] + (target[0] - snap[0]) * tEase,
+                snap[1] + (target[1] - snap[1]) * tEase,
+                snap[2] + (target[2] - snap[2]) * tEase,
+            ])
+        }
+    } else {
+        // Normal — snapshot from current scene
+        const prevScene = SCENES[prevIndex]
+        for (let i = 0; i < particles.length; i++) {
+            const p = particles[i]
+            const pos = prevScene.transform(p.basePos, p.dist, time, p)
+            snapshots.push([pos[0], pos[1], pos[2]])
+        }
     }
-    while (transitionTo.particles.length < maxLen) {
-        const src = transitionTo.particles[transitionTo.particles.length % newParticles.length]
-        transitionTo.particles.push({ ...src, basePos: [...src.basePos] })
+
+    const maxLen = Math.max(snapshots.length, newParticles.length)
+    const origSnapLen = snapshots.length
+    const origNewLen = newParticles.length
+
+    // Pad snapshots if new scene has more particles
+    while (snapshots.length < maxLen) {
+        const src = snapshots[snapshots.length % origSnapLen]
+        snapshots.push([
+            src[0] + (Math.random() - 0.5) * 0.3,
+            src[1] + (Math.random() - 0.5) * 0.3,
+            src[2] + (Math.random() - 0.5) * 0.3,
+        ])
     }
-    // Expand history to match
-    while (history.length < maxLen) history.push([])
+    // Pad new particles if old scene had more
+    while (newParticles.length < maxLen) {
+        const src = newParticles[newParticles.length % origNewLen]
+        newParticles.push({ ...src, basePos: [...src.basePos], seed: Math.random() })
+    }
+
+    // Per-particle stagger — particles don't all start moving at once
+    const stagger = new Float32Array(maxLen)
+    for (let i = 0; i < maxLen; i++) {
+        stagger[i] = Math.random() * 0.3 // 0–30% delay
+    }
+
+    transitionSnapshots = snapshots
+    transitionTo = { sceneIndex: currentScene, particles: newParticles }
+    transitionFromSceneIndex = prevIndex
+    transitionStagger = stagger
     transitionProgress = 0
+    needsFBOClear = true
+
+    // Clear histories so trails show the flight path
+    for (let i = 0; i < maxLen; i++) {
+        if (!history[i]) history[i] = []
+        else history[i].length = 0
+    }
+
     updateHUD()
     flashHUD()
 }
@@ -1152,6 +1361,10 @@ const main = () => {
     const [initW, initH] = getCanvasSize()
     canvas.width = initW; canvas.height = initH
     canvasW = initW; canvasH = initH
+    canvas.style.position = 'fixed'
+    canvas.style.top = '50%'
+    canvas.style.left = '50%'
+    canvas.style.transform = 'translate(-50%, -50%)'
     const gl = canvas.getContext("webgl2", { preserveDrawingBuffer: true })
     gl.getExtension('EXT_color_buffer_float')
     gl.viewport(0, 0, canvasW, canvasH)
@@ -1213,8 +1426,6 @@ const main = () => {
     const compIntensityLoc = gl.getUniformLocation(compositeProgram, "uBloomIntensity")
     const compSatLoc = gl.getUniformLocation(compositeProgram, "uSaturation")
 
-    let time = 0
-
     resetScene()
 
     const draw = () => {
@@ -1250,39 +1461,50 @@ const main = () => {
             time = 0
         }
 
+        // Clear FBO at transition start so old trails don't linger
+        if (needsFBOClear) {
+            gl.bindFramebuffer(gl.FRAMEBUFFER, sceneFBO.fbo)
+            gl.clearColor(0, 0, 0, 1); gl.clear(gl.COLOR_BUFFER_BIT)
+            gl.bindFramebuffer(gl.FRAMEBUFFER, null)
+            needsFBOClear = false
+        }
+
         const scene = SCENES[currentScene]
         const palette = PALETTES[currentPalette]
 
         // Handle transition blending
-        const inTransition = transitionProgress >= 0 && transitionProgress <= 1
-        let tEase = 0
+        let inTransition = transitionProgress >= 0 && transitionProgress <= 1
+        let tGlobal = 0
         if (inTransition) {
             transitionProgress += 1 / TRANSITION_FRAMES
-            // Smooth ease-in-out
-            tEase = transitionProgress < 0.5
-                ? 2 * transitionProgress * transitionProgress
-                : 1 - Math.pow(-2 * transitionProgress + 2, 2) / 2
+            tGlobal = transitionProgress
             if (transitionProgress >= 1) {
                 // Transition complete — commit to new scene
                 particles = transitionTo.particles
                 history = history.slice(0, particles.length)
                 transitionProgress = -1
-                transitionFrom = null
+                transitionSnapshots = null
                 transitionTo = null
+                transitionStagger = null
+                inTransition = false
             }
         }
 
         // Camera — blend between old and new during transition
         let cam
-        if (inTransition && transitionFrom) {
-            const camA = SCENES[transitionFrom.sceneIndex].camera
+        if (inTransition && transitionSnapshots) {
+            const camA = SCENES[transitionFromSceneIndex].camera
             const camB = SCENES[transitionTo.sceneIndex].camera
+            // Camera uses smooth ease-in-out
+            const camT = tGlobal < 0.5
+                ? 2 * tGlobal * tGlobal
+                : 1 - Math.pow(-2 * tGlobal + 2, 2) / 2
             cam = {
-                radius: camA.radius + (camB.radius - camA.radius) * tEase,
-                height: camA.height + (camB.height - camA.height) * tEase,
-                heightWave: camA.heightWave + (camB.heightWave - camA.heightWave) * tEase,
-                speed: camA.speed + (camB.speed - camA.speed) * tEase,
-                heightSpeed: camA.heightSpeed + (camB.heightSpeed - camA.heightSpeed) * tEase,
+                radius: camA.radius + (camB.radius - camA.radius) * camT,
+                height: camA.height + (camB.height - camA.height) * camT,
+                heightWave: camA.heightWave + (camB.heightWave - camA.heightWave) * camT,
+                speed: camA.speed + (camB.speed - camA.speed) * camT,
+                heightSpeed: camA.heightSpeed + (camB.heightSpeed - camA.heightSpeed) * camT,
             }
         } else {
             cam = scene.camera
@@ -1300,25 +1522,32 @@ const main = () => {
         let vertCount = 0, dataOffset = 0
 
         const activeCount = inTransition && transitionTo
-            ? Math.max(transitionFrom.particles.length, transitionTo.particles.length)
+            ? transitionSnapshots.length
             : particles.length
 
         for (let i = 0; i < activeCount; i++) {
             let pos
             let p
-            if (inTransition && transitionFrom && transitionTo) {
-                const fromScene = SCENES[transitionFrom.sceneIndex]
+            if (inTransition && transitionSnapshots && transitionTo) {
                 const toScene = SCENES[transitionTo.sceneIndex]
-                const pFrom = transitionFrom.particles[i]
                 const pTo = transitionTo.particles[i]
                 p = pTo
-                const posA = fromScene.transform(pFrom.basePos, pFrom.dist, time, pFrom)
-                transitionTo.time += 0 // keep time in sync
-                const posB = toScene.transform(pTo.basePos, pTo.dist, time, pTo)
+
+                // Per-particle progress with stagger
+                const delay = transitionStagger[i]
+                const localT = Math.max(0, Math.min(1, (tGlobal - delay) / (1 - delay)))
+                // Ease-out with slight overshoot for snappy arrival
+                const tEase = localT < 1
+                    ? 1 - Math.pow(1 - localT, 3) + Math.sin(localT * Math.PI) * 0.08
+                    : 1
+
+                const snapPos = transitionSnapshots[i]
+                const targetPos = toScene.transform(pTo.basePos, pTo.dist, time, pTo)
+
                 pos = [
-                    posA[0] + (posB[0] - posA[0]) * tEase,
-                    posA[1] + (posB[1] - posA[1]) * tEase,
-                    posA[2] + (posB[2] - posA[2]) * tEase,
+                    snapPos[0] + (targetPos[0] - snapPos[0]) * tEase,
+                    snapPos[1] + (targetPos[1] - snapPos[1]) * tEase,
+                    snapPos[2] + (targetPos[2] - snapPos[2]) * tEase,
                 ]
             } else {
                 p = particles[i]
@@ -1331,7 +1560,7 @@ const main = () => {
             if (p.respawned) hist.length = 0
             hist.push(pos)
             const maxTrail = inTransition
-                ? Math.max(SCENES[transitionFrom.sceneIndex].trailLength, SCENES[transitionTo.sceneIndex].trailLength)
+                ? 4
                 : scene.trailLength
             if (hist.length > maxTrail) hist.shift()
 
@@ -1382,8 +1611,8 @@ const main = () => {
         gl.enable(gl.BLEND)
         gl.blendFunc(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA)
         gl.useProgram(fadeProgram)
-        const fadeAlpha = inTransition && transitionFrom
-            ? SCENES[transitionFrom.sceneIndex].fadeAlpha + (SCENES[transitionTo.sceneIndex].fadeAlpha - SCENES[transitionFrom.sceneIndex].fadeAlpha) * tEase
+        const fadeAlpha = inTransition && transitionSnapshots
+            ? SCENES[transitionFromSceneIndex].fadeAlpha + (SCENES[transitionTo.sceneIndex].fadeAlpha - SCENES[transitionFromSceneIndex].fadeAlpha) * tGlobal
             : scene.fadeAlpha
         gl.uniform1f(fadeAlphaLoc, fadeAlpha)
         gl.bindVertexArray(quadVAO)
